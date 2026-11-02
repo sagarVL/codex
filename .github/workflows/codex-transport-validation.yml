@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: codex-transport-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   transport:
     if: github.repository != 'openai/codex'
@@ -47,11 +51,15 @@ jobs:
         run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy
 
       - name: Resolve focused dependencies and check version provenance
+        id: dependencies
         working-directory: transport-source
         run: |
           set -euo pipefail
           cargo +1.95.0 metadata --format-version 1 > ../resolved-metadata.json
           python ../verify_lock.py ../codex/codex-rs/Cargo.lock Cargo.lock
+
+      - name: Report test environment overrides
+        run: python -c "import os; print({key: bool(os.environ.get(key)) for key in ('CODEX_CA_CERTIFICATE', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'HTTPS_PROXY', 'HTTP_PROXY')})"
 
       - name: Check formatting of the proposed test additions
         working-directory: codex/codex-rs
@@ -61,14 +69,27 @@ jobs:
             core/tests/suite/websocket_fallback.rs \
             websocket-client/src/dialer_tests.rs
 
-      - name: Run transport library tests
+      - name: Run API library tests
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         working-directory: transport-source
-        run: cargo +1.95.0 test --locked -j 2 -p codex-api -p codex-http-client -p codex-websocket-client --lib
+        run: cargo +1.95.0 test --locked -j 2 -p codex-api --lib
+
+      - name: Run HTTP library tests
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        working-directory: transport-source
+        run: cargo +1.95.0 test --locked -j 2 -p codex-http-client --lib
+
+      - name: Run WebSocket library tests
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        working-directory: transport-source
+        run: cargo +1.95.0 test --locked -j 2 -p codex-websocket-client --lib
 
       - name: Run custom CA integration tests
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         working-directory: transport-source
         run: cargo +1.95.0 test --locked -j 2 -p codex-http-client --test ca_env
 
       - name: Run transport lint checks
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         working-directory: transport-source
         run: cargo +1.95.0 clippy --locked -j 2 -p codex-api -p codex-http-client -p codex-websocket-client --lib --tests -- -D warnings
