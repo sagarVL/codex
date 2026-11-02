@@ -1,0 +1,168 @@
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+index ce32a37..d3a6b27 100644
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -1154,6 +1154,31 @@ mod tests {
+         assert!(config.extensions.permessage_deflate.is_some());
+     }
+ 
++    #[test]
++    fn websocket_connect_errors_do_not_enter_unbounded_http_connection_retries() {
++        let url = Url::parse("wss://localhost/v1/responses").unwrap();
++        let errors = [
++            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
++            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
++            // Tokio-rustls wraps certificate validation failures in I/O errors.
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidData,
++                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
++            ),
++        ];
++
++        for error in errors {
++            let error = crate::map_api_error(map_ws_error(WsError::Io(error), &url));
++            // The sampling loop applies its bounded stream retry budget to these errors.
++            // Only HTTP's TransportError::Connection maps to ConnectionFailed.
++            assert!(matches!(
++                error.details(),
++                codex_protocol::error::CodexErrorDetails::Stream(_)
++            ));
++            assert!(error.retry_delay(1).is_some());
++        }
++    }
++
+     #[test]
+     fn parse_wrapped_websocket_error_event_maps_to_transport_http() {
+         let payload = json!({
+diff --git a/codex-rs/core/tests/suite/websocket_fallback.rs b/codex-rs/core/tests/suite/websocket_fallback.rs
+index afe5090..731bfea 100644
+--- a/codex-rs/core/tests/suite/websocket_fallback.rs
++++ b/codex-rs/core/tests/suite/websocket_fallback.rs
+@@ -1,5 +1,6 @@
+ use anyhow::Result;
+ use codex_core::TurnInputRequest;
++use codex_features::Feature;
+ use codex_model_provider_info::WireApi;
+ use codex_protocol::config_types::CollaborationMode;
+ use codex_protocol::config_types::ModeKind;
+@@ -127,6 +128,58 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
+     Ok(())
+ }
+ 
++#[test_case::test_case(true; "unbounded_connections_enabled")]
++#[test_case::test_case(false; "unbounded_connections_disabled")]
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn websocket_connect_timeout_exhausts_stream_budget_before_http_fallback(
++    unbounded_connections: bool,
++) -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = responses::start_mock_server().await;
++    Mock::given(method("GET"))
++        .and(path_regex(".*/responses$"))
++        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
++        .mount(&server)
++        .await;
++    let response_mock = mount_sse_once(
++        &server,
++        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
++    )
++    .await;
++
++    let mut builder = test_codex().with_config({
++        let base_url = format!("{}/v1", server.uri());
++        move |config| {
++            if unbounded_connections {
++                config.features.enable(Feature::UnboundedConnectionRetries);
++            } else {
++                config.features.disable(Feature::UnboundedConnectionRetries);
++            }
++            config.model_provider.base_url = Some(base_url);
++            config.model_provider.wire_api = WireApi::Responses;
++            config.model_provider.supports_websockets = true;
++            config.model_provider.stream_max_retries = Some(2);
++            config.model_provider.request_max_retries = Some(0);
++            config.model_provider.websocket_connect_timeout_ms = Some(50);
++        }
++    });
++    let test = builder.build(&server).await?;
++
++    timeout(Duration::from_secs(10), test.submit_turn("hello")).await??;
++
++    let requests = server.received_requests().await.unwrap_or_default();
++    let websocket_attempts = requests
++        .iter()
++        .filter(|req| req.method == Method::GET && req.url.path().ends_with("/responses"))
++        .count();
++    // One startup prewarm, then an initial attempt plus two stream retries.
++    assert_eq!(websocket_attempts, 4);
++    assert_eq!(response_mock.requests().len(), 1);
++
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/websocket-client/src/dialer_tests.rs b/codex-rs/websocket-client/src/dialer_tests.rs
+index e965915..9e55f75 100644
+--- a/codex-rs/websocket-client/src/dialer_tests.rs
++++ b/codex-rs/websocket-client/src/dialer_tests.rs
+@@ -208,6 +208,57 @@ async fn http_proxy_tunnels_secure_websocket_before_handshake() {
+     assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ false).await;
+ }
+ 
++#[tokio::test]
++async fn direct_route_rejects_untrusted_websocket_certificate() {
++    let (_, acceptor, _) = test_tls_configs();
++    let config = ClientConfig::builder()
++        .with_root_certificates(RootCertStore::empty())
++        .with_no_client_auth();
++    assert_direct_route_rejects_certificate(Arc::new(config), acceptor, "localhost").await;
++}
++
++#[tokio::test]
++async fn direct_route_rejects_websocket_certificate_for_wrong_hostname() {
++    let (config, acceptor, _) = test_tls_configs();
++    // The trusted certificate contains only the DNS name localhost, not this IP address.
++    assert_direct_route_rejects_certificate(config, acceptor, "127.0.0.1").await;
++}
++
++async fn assert_direct_route_rejects_certificate(
++    config: Arc<ClientConfig>,
++    acceptor: TlsAcceptor,
++    host: &str,
++) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    let target_task = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await.unwrap();
++        assert!(acceptor.accept(stream).await.is_err());
++    });
++    let request = format!("wss://{host}:{port}/v1/responses")
++        .into_client_request()
++        .unwrap();
++    let result = connect(
++        request,
++        WebSocketConfig::default(),
++        Some(config),
++        OutboundProxyRoute::Direct,
++        TcpNodelay::Enabled,
++        /*loopback_direct*/ false,
++    )
++    .await;
++    let Err(tokio_tungstenite::tungstenite::Error::Io(error)) = result else {
++        panic!("expected TLS certificate validation to fail");
++    };
++    assert!(matches!(
++        error
++            .get_ref()
++            .and_then(|source| source.downcast_ref::<rustls::Error>()),
++        Some(rustls::Error::InvalidCertificate(_))
++    ));
++    target_task.await.unwrap();
++}
++
+ #[tokio::test]
+ async fn https_proxy_tunnels_secure_websocket_before_handshake() {
+     assert_proxy_tunnels_secure_websocket(/*proxy_tls*/ true).await;
