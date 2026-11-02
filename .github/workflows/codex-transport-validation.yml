@@ -80,6 +80,17 @@ jobs:
         working-directory: transport-source
         run: cargo +1.95.0 test --locked -j 2 -p codex-http-client --lib
 
+      - name: Diagnose the existing logging assertion in isolation
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        working-directory: transport-source
+        run: |
+          cargo +1.95.0 test --locked -j 2 -p codex-http-client --lib outbound_proxy::redirect_integration_tests::route_aware_pool_re_resolves_redirects_and_logs_only_final_outcome -- --exact --nocapture
+
+      - name: Diagnose HTTP library tests with serial execution
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        working-directory: transport-source
+        run: cargo +1.95.0 test --locked -j 2 -p codex-http-client --lib -- --test-threads=1
+
       - name: Run WebSocket library tests
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         working-directory: transport-source
