@@ -38,13 +38,15 @@ jobs:
           git -C codex fetch --depth 1 origin "$BASE_SHA"
           git -C codex checkout --detach FETCH_HEAD
           test "$(git -C codex rev-parse HEAD)" = "$BASE_SHA"
-          for file in prepare_transport_workspace.py verify_lock.py regression-tests.patch; do
+          for file in prepare_transport_workspace.py verify_lock.py regression-tests.patch logging-test-isolation.patch; do
             curl --fail --location --proto '=https' --tlsv1.2 \
               "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/validation/${file}" \
               --output "$file"
           done
           git -C codex apply --check ../regression-tests.patch
           git -C codex apply ../regression-tests.patch
+          git -C codex apply --check ../logging-test-isolation.patch
+          git -C codex apply ../logging-test-isolation.patch
           python prepare_transport_workspace.py
 
       - name: Install the repository's pinned Rust toolchain
@@ -66,6 +68,7 @@ jobs:
         working-directory: codex/codex-rs
         run: |
           rustup run 1.95.0 rustfmt --edition 2024 --check \
+            http-client/src/route_aware_redirect_integration_tests.rs \
             codex-api/src/endpoint/responses_websocket.rs \
             core/tests/suite/websocket_fallback.rs \
             websocket-client/src/dialer_tests.rs
